@@ -13,3 +13,4 @@ For interactive documentation go to the ```/docs``` path of the API
 ```
 uvicorn main:app
 ```
+Now you can access the API via ```http://127.0.0.1:8000/```. This should give you a welcome message.
