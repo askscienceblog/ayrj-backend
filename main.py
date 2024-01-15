@@ -1,27 +1,34 @@
 import re
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Any
 
-from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.security import APIKeyHeader
+from google.api_core.exceptions import NotFound
 from google.cloud import firestore
 from pydantic import BaseModel
 
 # used to authenticate access to restricted parts of this api
 key_header = APIKeyHeader(name="x-ayrj-key", auto_error=False)
-KEY = "In science we find truth, @ ayrj we have this API"  # protect at all cost. if this leaks, we have lost everything
+KEY = "CENSORED"  # protect at all cost. if this leaks, we have lost everything
 
 # regex to match doi urls so that they can be automatically extracted
 # this is not foul-proof, there is no way to check if the matched url is valid without actually requesting doi.org
 MATCH_DOI = re.compile("10\\.[\\.0-9]+/\\S*\\w")
 
-db = firestore.AsyncClient(project="key-being-411010")
+db = firestore.AsyncClient(project="CENSORED")
 
 # use the same collection id so that all papers can be searched with a collection group query
 papers = db.collection("papers")
+
 reviewing = papers.document("reviewing").collection("paper-data")
+reviewing: firestore.AsyncCollectionReference
+
 published = papers.document("published").collection("paper-data")
+published: firestore.AsyncCollectionReference
+
 retracted = papers.document("retracted").collection("paper-data")
+retracted: firestore.AsyncCollectionReference
 
 document_repo = db.collection("documents")
 
@@ -39,7 +46,7 @@ def generate_author_shorthand(authors: list[str]) -> str:
 
     match len(authors):
         case 0:
-            raise HTTPException(400, "No authors provided")
+            raise ValueError("No authors provided")
         case 1:
             return authors[0]
         case 2:
@@ -57,11 +64,32 @@ async def generate_unique_document_id(seed: bytes) -> str:
 
     # check if the id is already used, increment it until it is no longer in use
     while (await document_repo.document(code).get()).exists:
-        id += 1
+        id = hash(code)
         id %= 1_000_000_000
         code = format_id_to_string(id)
 
     return code
+
+
+@firestore.async_transactional
+async def move_document(
+    transaction: firestore.AsyncTransaction,
+    document_id: str,
+    from_collection: firestore.AsyncCollectionReference,
+    to_collection: firestore.AsyncCollectionReference,
+) -> dict[str, Any]:
+    doc_ref = from_collection.document(document_id)
+    document = await doc_ref.get(transaction=transaction)
+    if not document.exists:
+        raise ValueError(
+            f"Document with id `{document_id}` does not exist in the specified collection"
+        )
+
+    doc_dict = document.to_dict()
+    transaction.set(to_collection.document(document_id), doc_dict)
+    transaction.delete(doc_ref)
+
+    return doc_dict
 
 
 class Correction(BaseModel):
@@ -89,6 +117,13 @@ class Paper(BaseModel):
     retracted: datetime | None = None
 
 
+class PaperFile(BaseModel):
+    name: str
+    mime_type: str
+
+    data: bytes
+
+
 app = FastAPI()
 
 
@@ -99,55 +134,67 @@ async def welcome() -> str:
 
 @app.post("/submit")
 async def submit(
-    title: Annotated[str, Form()],
-    abstract: Annotated[str, Form()],
-    authors: Annotated[list[str], Form()],
-    category: Annotated[str, Form()],
-    references: Annotated[list[str], Form()],
-    doc: UploadFile,
+    title: str = Form(),
+    abstract: str = Form(),
+    authors: list[str] = Form(),
+    category: str = Form(),
+    references: list[str] = Form(),
+    doc: UploadFile = File(),
     key: str = Depends(key_header),
-) -> None:
+) -> str:
     """Handles initialising all paper data and adding it to the `reviewing` collection"""
 
     if key != KEY:
         raise HTTPException(401)
 
-    if (
-        doc.content_type != "application/msword"
-        and doc.content_type
-        != "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ):
-        raise HTTPException(400, "Upload `.doc` or `.docx` files only")
+    # get file extension and check if its a valid file type
+    match doc.content_type:
+        case "application/msword":
+            extension = "doc"
+        case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            extension = "docx"
+        case _:
+            raise HTTPException(400, "Upload `.doc` or `.docx` files only")
 
     # shorthand for authors, also validates that `authors` is non-empty
-    shorthand = generate_author_shorthand(authors)
+    try:
+        shorthand = generate_author_shorthand(authors)
+    except ValueError:
+        raise HTTPException(400, "No authors provided")
 
     doc_bytes = await doc.read(-1)
     await doc.close()
 
     code = await generate_unique_document_id(doc_bytes)
 
+    write_batch = db.batch()
+
     # upload document
-    await document_repo.document(code).set(
-        {
-            "filename": f"{shorthand} DRAFT.docx",
-            "bytes": doc_bytes,
-        }
+    write_batch.set(
+        document_repo.document(code),
+        PaperFile(
+            name=f"{shorthand} DRAFT.{extension}",
+            mime_type=doc.content_type,
+            data=doc_bytes,
+        ).model_dump(),
     )
-    del doc_bytes  # free memory since file may be large
 
     # create the `Paper` object, using pydantic parser to enforce type checking
-    paper = Paper(
-        id=code,
-        title=title,
-        abstract=abstract,
-        authors=authors,
-        category=category,
-        references=references,
-        submitted=datetime.now(tz=timezone.utc),
+    write_batch.set(
+        reviewing.document(code),
+        Paper(
+            id=code,
+            title=title,
+            abstract=abstract,
+            authors=authors,
+            category=category,
+            references=references,
+            submitted=datetime.now(tz=timezone.utc),
+        ).model_dump(),
     )
 
-    await reviewing.document(code).set(paper.model_dump())
+    await write_batch.commit()
+    return code
 
 
 @app.put("/publish")
@@ -157,24 +204,21 @@ async def publish(id: str, key: str = Depends(key_header)) -> None:
     if key != KEY:
         raise HTTPException(401)
 
-    paper_ref = reviewing.document(id)
-    paper = await paper_ref.get()
+    doc_type = await document_repo.document(id).get(["mime_type"])
 
-    if not paper.exists:
-        raise HTTPException(400, "Paper does not exist in review list")
+    try:
+        if doc_type.to_dict()["mime_type"] != "application/pdf":
+            raise HTTPException(400, "Change paper document to pdf before publication")
 
-    now = datetime.now(tz=timezone.utc)
-    paper = Paper.model_validate(paper.to_dict())
-    paper.published = now
+        await reviewing.document(id).update(
+            {"published": datetime.now(tz=timezone.utc)}
+        )
+    except (NotFound, KeyError):
+        raise HTTPException(
+            400, f"Document with id {id} does not exist in `reviewing` collection"
+        )
 
-    await published.document(id).set(paper.model_dump())
-    await paper_ref.delete()
-
-    await document_repo.document(id).update(
-        {
-            "filename": f"{generate_author_shorthand(paper.authors)} ({now.strftime("%Y")}).pdf"
-        }
-    )
+    await move_document(db.transaction(), id, reviewing, published)
 
 
 @app.delete("/reject")
@@ -184,24 +228,22 @@ async def reject(id: str, key: str = Depends(key_header)) -> None:
     if key != KEY:
         raise HTTPException(401)
 
-    paper_ref = reviewing.document(id)
-    paper = await paper_ref.get()
+    delete_batch = db.batch()
 
-    if not paper.exists:
-        raise HTTPException(400, "Paper does not exist in review list")
-    await paper_ref.delete()
-    await document_repo.document(id).delete()
+    delete_batch.delete(reviewing.document(id))
+    delete_batch.delete(document_repo.document(id))
+    await delete_batch.commit()
 
 
 @app.patch("/review")
 async def review(
-    id: Annotated[str, Form()],
-    title: Annotated[str | None, Form()] = None,
-    abstract: Annotated[str | None, Form()] = None,
-    authors: Annotated[list[str] | None, Form()] = None,
-    category: Annotated[str | None, Form()] = None,
-    references: Annotated[list[str] | None, Form()] = None,
-    doc: UploadFile | None = None,
+    id: str = Form(),
+    title: str = Form(None),
+    abstract: str = Form(None),
+    authors: list[str] = Form(None),
+    category: str = Form(None),
+    references: list[str] = Form(None),
+    doc: UploadFile = File(None),
     key: str = Depends(key_header),
 ) -> None:
     """Updates paper in `reviewing` collection"""
@@ -210,28 +252,28 @@ async def review(
         raise HTTPException(401)
 
     paper_ref = reviewing.document(id)
-    paper = await paper_ref.get()
+    paper = await paper_ref.get(["authors"])
 
     if not paper.exists:
-        raise HTTPException(400, "Paper does not exist in reviewing list")
+        raise HTTPException(400, "Paper does not exist in `reviewing` collection")
 
     if doc is not None:
-        if (
-            doc.content_type == "application/msword"
-            or doc.content_type
-            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ):
-            extension = "docx"
-        elif doc.content_type == "application/pdf":
-            extension = "pdf"
-        else:
-            raise HTTPException(400, "Upload `.pdf`, `.doc` or `.docx` files only")
+        match doc.content_type:
+            case "application/msword":
+                extension = "doc"
+            case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                extension = "docx"
+            case "application/pdf":
+                extension = "pdf"
+            case _:
+                raise HTTPException(400, "Upload `.pdf`, `.doc` or `.docx` files only")
 
-        await document_repo.document(id).update(
-            {
-                "filename": f"{generate_author_shorthand(paper.authors)} DRAFT.{extension}",
-                "bytes": await doc.read(-1),
-            }
+        await document_repo.document(id).set(
+            PaperFile(
+                name=f"{generate_author_shorthand(paper.to_dict()["authors"])} DRAFT.{extension}",
+                mime_type=doc.content_type,
+                data=await doc.read(-1),
+            ).model_dump()
         )
         await doc.close()
 
@@ -248,7 +290,7 @@ async def review(
     if references is not None:
         update_dict |= {"references": references}
 
-    if update_dict or doc is not None:
+    if update_dict or doc:
         await paper_ref.update(
             update_dict
             | {"reviewed": firestore.ArrayUnion([datetime.now(tz=timezone.utc)])}
@@ -257,23 +299,22 @@ async def review(
 
 @app.put("/retract")
 async def retract(id: str, key: str = Depends(key_header)) -> None:
-    """Moves paper from `reviewing` collection to `retracted` collection
+    """Moves paper from `published` collection to `retracted` collection
     Retracts paper but does not actually delete any data"""
 
     if key != KEY:
         raise HTTPException(401)
 
-    paper_ref = published.document(id)
-    paper = await paper_ref.get()
+    try:
+        await published.document(id).update(
+            {"retracted": datetime.now(tz=timezone.utc)}
+        )
+    except NotFound:
+        raise HTTPException(
+            400, f"Document with id `{id}` does not exist in `published` collection"
+        )
 
-    if not paper.exists:
-        raise HTTPException(400, "Paper does not exist in published list")
-
-    paper = Paper.model_validate(paper.to_dict())
-    paper.retracted = datetime.now(tz=timezone.utc)
-
-    await retracted.document(id).set(paper.model_dump())
-    await paper_ref.delete()
+    await move_document(db.transaction(), id, published, retracted)
 
 
 @app.delete("/remove")
@@ -284,22 +325,28 @@ async def remove(id: str, key: str = Depends(key_header)) -> None:
         raise HTTPException(401)
 
     paper_ref = retracted.document(id)
-    paper = await paper_ref.get()
+    paper = await paper_ref.get(["corrected"])
     if not paper.exists:
         raise HTTPException(400, "Paper does not exist in retracted list")
+    delete_batch = db.batch()
+    for correction in paper.to_dict()["corrected"]:
+        # remove all document data but leave the document name, this will prevent retracted `id`s from being reused
+        delete_batch.set(document_repo.document(correction["id"]), {})
 
-    await paper_ref.delete()
+    delete_batch.delete(paper_ref)
     # remove all document data but leave the document name, this will prevent retracted `id`s from being reused
-    await document_repo.document(id).set({})
+    delete_batch.set(document_repo.document(id), {})
+
+    await delete_batch.commit()
 
 
 @app.post("/correct")
 async def correct(
-    id: Annotated[str, Form()],
-    description: Annotated[str, Form()],
-    doc: UploadFile,
+    id: str = Form(),
+    description: str = Form(),
+    doc: UploadFile = File(),
     key: str = Depends(key_header),
-) -> None:
+) -> str:
     "Adds a correction to a published paper"
 
     if key != KEY:
@@ -309,31 +356,38 @@ async def correct(
         raise HTTPException(400, "Please upload only `.pdf` files")
 
     paper_ref = published.document(id)
-    paper = await paper_ref.get()
+    paper = await paper_ref.get(["authors", "corrected"])
     if not paper.exists:
         raise HTTPException(400, "Paper does not exist in published list")
 
     doc_bytes = await doc.read(-1)
     await doc.close()
-    code = generate_unique_document_id(doc_bytes)
+    code = await generate_unique_document_id(doc_bytes)
 
-    await document_repo.document(code).set(
-        {
-            "filename": f"{generate_author_shorthand(paper.authors)} Correction {len(paper.corrected)+1}.pdf",
-            "bytes": doc_bytes,
-        }
+    paper_dict = paper.to_dict()
+    write_batch = db.batch()
+    write_batch.set(
+        document_repo.document(code),
+        PaperFile(
+            name=f"{generate_author_shorthand(paper_dict["authors"])} Correction {len(paper_dict["corrected"])+1}.pdf",
+            mime_type=doc.content_type,
+            data=doc_bytes,
+        ).model_dump(),
     )
 
-    await paper_ref.update(
+    write_batch.update(
+        paper_ref,
         {
             "corrected": firestore.ArrayUnion(
                 [
                     Correction(
-                        id=id,
+                        id=code,
                         date=datetime.now(tz=timezone.utc),
                         description=description,
-                    )
+                    ).model_dump()
                 ]
             )
-        }
+        },
     )
+    await write_batch.commit()
+    return code
