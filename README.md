@@ -4,6 +4,7 @@ Backend API for AYRJ written in Python using FastAPI
 Install the `gcloud` CLI tool and login first. Then,
 ```
 pip install fastapi[all]
+pip install aiofiles
 pip install google-cloud-firestore
 gcloud auth application-default login
 ```
