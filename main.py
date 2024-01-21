@@ -21,9 +21,9 @@ KEY = "In science we find truth, @ ayrj we have this API"  # protect at all cost
 MATCH_DOI = re.compile("10\\.[\\.0-9]+/\\S*\\w")
 
 # file path for mounted gcloud storage FUSE
-DOCS_PATH = "/home/profile/ayrj-docs"
+DOCS_PATH = "/docs"
 
-db = firestore.AsyncClient(project="focus-champion-411608")
+db = firestore.AsyncClient(project="ayrj-backend")
 
 # use the same collection id so that all papers can be searched with a collection group query
 papers = db.collection("papers")
@@ -229,7 +229,7 @@ async def publish(id: str, key: str = Depends(key_header)) -> None:
     await reviewing.document(id).update(
         {
             "published": now,
-            "document_name": f"{generate_author_shorthand(paper_dict['authors'])} ({now.strftime('%y')}).pdf",
+            "document_name": f"{generate_author_shorthand(paper_dict['authors'])} ({now.strftime('%Y')}).pdf",
         }
     )
 
@@ -393,7 +393,7 @@ async def correct(
                         id=code,
                         date=datetime.now(tz=timezone.utc),
                         description=description,
-                        document_name=f"{generate_author_shorthand(paper_dict['authors'])} ({paper_dict['published'].strftime('%y')}) Correction {len(paper_dict['corrected'])+1}.pdf",
+                        document_name=f"{generate_author_shorthand(paper_dict['authors'])} ({paper_dict['published'].strftime('%Y')}) Correction {len(paper_dict['corrected'])+1}.pdf",
                     ).model_dump()
                 ]
             ),
