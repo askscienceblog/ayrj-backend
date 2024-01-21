@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 
 import aiofiles
 import aiofiles.os
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
 from google.api_core.exceptions import NotFound
@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, NonNegativeInt
 
 # used to authenticate access to restricted parts of this api
 key_header = APIKeyHeader(name="x-ayrj-key", auto_error=False)
-KEY = "CENSORED"  # protect at all cost. if this leaks, we have lost everything
+KEY = "In science we find truth, @ ayrj we have this API"  # protect at all cost. if this leaks, we have lost everything
 
 # regex to match doi urls so that they can be automatically extracted
 # this is not foul-proof, there is no way to check if the matched url is valid without actually requesting doi.org
@@ -23,7 +23,7 @@ MATCH_DOI = re.compile("10\\.[\\.0-9]+/\\S*\\w")
 # file path for mounted gcloud storage FUSE
 DOCS_PATH = "/home/profile/ayrj-docs"
 
-db = firestore.AsyncClient(project="CENSORED")
+db = firestore.AsyncClient(project="focus-champion-411608")
 
 # use the same collection id so that all papers can be searched with a collection group query
 papers = db.collection("papers")
@@ -403,49 +403,59 @@ async def correct(
     return code
 
 
-class PaperQuery(BaseModel):
-    length: NonNegativeInt = 1
+@app.get("/list/{paper_type}")
+async def list_papers(
+    paper_type: Literal["published", "reviewing", "retracted", "all"],
+    length: NonNegativeInt = 1,
+    start_at_id: str | None = None,
+    start_at_date: datetime | None = None,
+    end_before_date: datetime | None = None,
+    category: str | None = None,
+    contains_authors: Annotated[list[str], Query()] = [],
+    contains_content: str = "",
+    content_match_quality_limit: Annotated[float, Field(ge=0.0, le=1.0)] = 0.1,
+    author_match_quality_limit: Annotated[float, Field(ge=0.0, le=1.0)] = 0.4,
+    key: str = Depends(key_header),
+) -> list[Paper]:
+    match paper_type:
+        case "published":
+            listing = published
+            date = "published"
+        case "retracted":
+            listing = retracted
+            date = "retracted"
+        case "reviewing":
+            if key != KEY:
+                raise HTTPException(401)
+            listing = reviewing
+            date = "submitted"
+        case "all":
+            if key != KEY:
+                raise HTTPException(401)
+            listing = db.collection_group("paper-data")
+            date = "submitted"
 
-    start_at_id: str | None = None
+    if start_at_id is not None:
+        listing = listing.start_at({"id": start_at_id})
 
-    start_at_date: datetime | None = None
-    end_before_date: datetime | None = None
-
-    category: str | None = None
-
-    contains_authors: list[str] = []
-    contains_content: str = ""
-
-    content_match_quality_limit: Annotated[float, Field(ge=0.0, le=1.0)] = 0.1
-    author_match_quality_limit: Annotated[float, Field(ge=0.0, le=1.0)] = 0.4
-
-
-@app.get("/list")
-async def list_papers(query: PaperQuery) -> list[Paper]:
-    listing = published
-
-    if query.start_at_id is not None:
-        listing = listing.start_at({"id": query.start_at_id})
-
-    if query.category is not None:
+    if category is not None:
         listing = listing.where(
-            filter=firestore.FieldFilter("category", "==", query.category)
+            filter=firestore.FieldFilter("category", "==", category)
         )
 
-    if query.start_at_date is not None:
-        listing = listing.where(
-            filter=firestore.FieldFilter("published", ">=", query.start_at_date)
-        )
+    if start_at_date is not None:
+        listing = listing.where(filter=firestore.FieldFilter(date, ">=", start_at_date))
 
-    if query.end_before_date is not None:
+    if end_before_date is not None:
         listing = listing.where(
-            filter=firestore.FieldFilter("published", "<", query.end_before_date)
+            filter=firestore.FieldFilter(date, "<", end_before_date)
         )
 
     out = []
+    out_len = 0
 
     async for paper in listing.stream():
-        queried_authors = query.contains_authors.copy()
+        queried_authors = contains_authors.copy()
         paper = Paper.model_validate(paper.to_dict())
 
         # check if the paper contains all the desired authors
@@ -455,35 +465,37 @@ async def list_papers(query: PaperQuery) -> list[Paper]:
                 break
             if (
                 match_string_quality(queried_authors[-1], author)
-                >= query.author_match_quality_limit
+                >= author_match_quality_limit
             ):
                 queried_authors.pop()
         else:
-            continue
+            if queried_authors:
+                continue
 
         # continue on to check if content matches as well
         # one big chunk because `or` is optimised to skip subsequent clauses if one clause evaluates to `True`
         if (
             match_string_quality(
-                query.contains_content, paper.title
+                contains_content, paper.title
             )  # check if title matches
-            >= query.content_match_quality_limit
+            >= content_match_quality_limit
             or match_string_quality(
-                query.contains_content, paper.abstract
+                contains_content, paper.abstract
             )  # check if abstract matches
-            >= query.content_match_quality_limit
+            >= content_match_quality_limit
             or any(
                 match_string_quality(
-                    query.contains_content, reference
+                    contains_content, reference
                 )  # check if any of the references match
-                >= query.content_match_quality_limit
+                >= content_match_quality_limit
                 for reference in paper.references
             )
         ):
             out.append(paper)
+            out_len += 1
 
             # break if query length limit reached
-            if len(out) >= query.length:
+            if out_len >= length:
                 break
 
     return out
@@ -497,34 +509,22 @@ async def get_paper(
 ) -> FileResponse:
     match paper_type:
         case "published":
-            paper = await published.document(id).get(
-                ["document_name", "document_mimetype"]
-            )
-            if not paper.exists:
-                raise HTTPException(
-                    400,
-                    f"Paper with `id`: {id} does not exist in `published` collection",
-                )
-            paper_dict = paper.to_dict()
-            return FileResponse(
-                f"{DOCS_PATH}/{id}",
-                media_type=paper_dict["document_mimetype"],
-                filename=paper_dict["document_name"],
-            )
+            collection = published
         case "reviewing":
             if key != KEY:
                 raise HTTPException(401)
-            paper = await reviewing.document(id).get(
-                ["document_name", "document_mimetype"]
-            )
-            if not paper.exists:
-                raise HTTPException(
-                    400,
-                    f"Paper with `id`: {id} does not exist in `reviewing` collection",
-                )
-            paper_dict = paper.to_dict()
-            return FileResponse(
-                f"{DOCS_PATH}/{id}",
-                media_type=paper_dict["document_mimetype"],
-                filename=paper_dict["document_name"],
-            )
+            collection = reviewing
+
+    paper = await collection.document(id).get(["document_name", "document_mimetype"])
+    if not paper.exists:
+        raise HTTPException(
+            400,
+            f"Paper with `id`: {id} does not exist in `{paper_type}` collection",
+        )
+
+    paper_dict = paper.to_dict()
+    return FileResponse(
+        f"{DOCS_PATH}/{id}",
+        media_type=paper_dict["document_mimetype"],
+        filename=paper_dict["document_name"],
+    )
