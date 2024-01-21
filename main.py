@@ -8,6 +8,7 @@ import aiofiles.os
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
 from google.api_core.exceptions import NotFound
 from google.cloud import firestore
 from pydantic import BaseModel, Field, NonNegativeInt
@@ -21,7 +22,7 @@ KEY = "In science we find truth, @ ayrj we have this API"  # protect at all cost
 MATCH_DOI = re.compile("10\\.[\\.0-9]+/\\S*\\w")
 
 # file path for mounted gcloud storage FUSE
-DOCS_PATH = "/docs"
+DOCS_PATH = "/home/profile/ayrj-docs"
 
 db = firestore.AsyncClient(project="ayrj-backend")
 
@@ -140,6 +141,10 @@ class Paper(BaseModel):
 
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
 
 
 @app.get("/")
