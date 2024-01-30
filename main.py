@@ -173,6 +173,8 @@ async def submit(
             extension = ".doc"
         case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             extension = ".docx"
+        case "application/pdf":
+            extension = ".pdf"
         case _:
             raise HTTPException(
                 400, f"Upload `.doc` or `.docx` files only, not `{doc.content_type}`"
@@ -439,7 +441,7 @@ async def list_papers(
                 raise HTTPException(401)
             listing = db.collection_group("paper-data")
             date = "submitted"
-
+    listing = listing.order_by("id").order_by(date)
     if start_at_id is not None:
         listing = listing.start_at({"id": start_at_id})
 
