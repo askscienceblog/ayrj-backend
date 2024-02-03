@@ -5,13 +5,14 @@ from typing import Annotated, Any, Literal
 
 import aiofiles
 import aiofiles.os
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
-from fastapi.middleware.cors import CORSMiddleware
 from google.api_core.exceptions import NotFound
 from google.cloud import firestore
 from pydantic import BaseModel, Field, NonNegativeInt
+from thefuzz import fuzz
 
 # used to authenticate access to restricted parts of this api
 key_header = APIKeyHeader(name="x-ayrj-key", auto_error=False)
@@ -38,18 +39,7 @@ published: firestore.AsyncCollectionReference
 retracted = papers.document("retracted").collection("paper-data")
 retracted: firestore.AsyncCollectionReference
 
-
-def match_string_quality(find: str, other: str) -> float:
-    if not find:
-        return 1.0
-    matches = 0
-    len_find = len(find)
-
-    for start in range(len_find):
-        for length in range(1, len_find - start + 1):
-            matches += find[start : start + length] in other
-
-    return (matches * 2) / (len_find * (len_find + 1))
+featured = db.collection("featured")
 
 
 def format_id_to_string(id: int) -> str:
@@ -177,14 +167,15 @@ async def submit(
             extension = ".pdf"
         case _:
             raise HTTPException(
-                400, f"Upload `.doc` or `.docx` files only, not `{doc.content_type}`"
+                415,
+                f"Upload `.pdf`, `.doc` or `.docx` files only, not `{doc.content_type}`",
             )
 
     # shorthand for authors, also validates that `authors` is non-empty
     try:
         shorthand = generate_author_shorthand(authors)
     except ValueError:
-        raise HTTPException(400, "No authors provided")
+        raise HTTPException(422, "No authors provided")
 
     code = await generate_unique_document_id()
 
@@ -213,7 +204,7 @@ async def submit(
     return code
 
 
-@app.put("/publish")
+@app.patch("/publish")
 async def publish(id: str, key: str = Depends(key_header)) -> None:
     """Moves paper from `reviewing` to `published` collection"""
 
@@ -224,13 +215,13 @@ async def publish(id: str, key: str = Depends(key_header)) -> None:
 
     if not paper.exists:
         raise HTTPException(
-            400, f"Document with id {id} does not exist in `reviewing` collection"
+            404, f"Document with id {id} does not exist in `reviewing` collection"
         )
 
     paper_dict = paper.to_dict()
 
     if paper_dict["document_mimetype"] != "application/pdf":
-        raise HTTPException(400, "Change paper document to pdf before publication")
+        raise HTTPException(415, "Change paper document to pdf before publication")
 
     now = datetime.now(tz=timezone.utc)
     await reviewing.document(id).update(
@@ -274,7 +265,9 @@ async def review(
     paper = await paper_ref.get(["authors", "title", "abstract", "references"])
 
     if not paper.exists:
-        raise HTTPException(400, "Paper does not exist in `reviewing` collection")
+        raise HTTPException(
+            404, f"Document with id `{id}` does not exist in `reviewing` collection"
+        )
 
     update_dict = {}
 
@@ -289,7 +282,7 @@ async def review(
             case "application/pdf":
                 extension = ".pdf"
             case _:
-                raise HTTPException(400, "Upload `.pdf`, `.doc` or `.docx` files only")
+                raise HTTPException(415, "Upload `.pdf`, `.doc` or `.docx` files only")
 
         async with aiofiles.open(f"{DOCS_PATH}/{id}", "wb") as file:
             await file.write(await doc.read(-1))
@@ -320,7 +313,7 @@ async def review(
         )
 
 
-@app.put("/retract")
+@app.patch("/retract")
 async def retract(id: str, key: str = Depends(key_header)) -> None:
     """Moves paper from `published` collection to `retracted` collection
     Retracts paper but does not actually delete any data"""
@@ -334,7 +327,7 @@ async def retract(id: str, key: str = Depends(key_header)) -> None:
         )
     except NotFound:
         raise HTTPException(
-            400, f"Document with id `{id}` does not exist in `published` collection"
+            404, f"Document with id `{id}` does not exist in `published` collection"
         )
 
     await move_document(db.transaction(), id, published, retracted)
@@ -350,7 +343,9 @@ async def remove(id: str, key: str = Depends(key_header)) -> None:
     paper_ref = retracted.document(id)
     paper = await paper_ref.get(["corrected"])
     if not paper.exists:
-        raise HTTPException(400, "Paper does not exist in retracted list")
+        raise HTTPException(
+            404, f"Document with id `{id}` does not exist in `retracted` collection"
+        )
 
     await paper_ref.delete()
 
@@ -378,12 +373,14 @@ async def correct(
         raise HTTPException(401)
 
     if doc.content_type != "application/pdf":
-        raise HTTPException(400, "Please upload only `.pdf` files")
+        raise HTTPException(415, "Please upload only `.pdf` files")
 
     paper_ref = published.document(id)
     paper = await paper_ref.get(["authors", "corrected", "published"])
     if not paper.exists:
-        raise HTTPException(400, "Paper does not exist in published list")
+        raise HTTPException(
+            404, f"Document with id `{id}` does not exist in `published` collection"
+        )
 
     code = await generate_unique_document_id()
     paper_dict = paper.to_dict()
@@ -418,10 +415,8 @@ async def list_papers(
     start_at_date: datetime | None = None,
     end_before_date: datetime | None = None,
     category: str | None = None,
-    contains_authors: Annotated[list[str], Query()] = [],
-    contains_content: str = "",
-    content_match_quality_limit: Annotated[float, Field(ge=0.0, le=1.0)] = 0.1,
-    author_match_quality_limit: Annotated[float, Field(ge=0.0, le=1.0)] = 0.4,
+    contains: str = "",
+    quality_limit: Annotated[int, Field(ge=0, le=100)] = 100,
     key: str = Depends(key_header),
 ) -> list[Paper]:
     match paper_type:
@@ -461,47 +456,23 @@ async def list_papers(
     out = []
     out_len = 0
 
+    if contains == "":
+        quality_limit = 0
+
     async for paper in listing.stream():
-        queried_authors = contains_authors.copy()
         paper = Paper.model_validate(paper.to_dict())
 
-        # check if the paper contains all the desired authors
-        for author in paper.authors:
-            # break if all queried authors have been matched
-            if not queried_authors:
-                break
-            if (
-                match_string_quality(queried_authors[-1], author)
-                >= author_match_quality_limit
-            ):
-                queried_authors.pop()
-        else:
-            if queried_authors:
-                continue
-
-        # continue on to check if content matches as well
-        # one big chunk because `or` is optimised to skip subsequent clauses if one clause evaluates to `True`
         if (
-            match_string_quality(
-                contains_content, paper.title
-            )  # check if title matches
-            >= content_match_quality_limit
-            or match_string_quality(
-                contains_content, paper.abstract
-            )  # check if abstract matches
-            >= content_match_quality_limit
+            fuzz.partial_ratio(contains, paper.title) >= quality_limit
+            or fuzz.partial_ratio(contains, paper.abstract) >= quality_limit
+            or fuzz.partial_ratio(contains, paper.references) >= quality_limit
             or any(
-                match_string_quality(
-                    contains_content, reference
-                )  # check if any of the references match
-                >= content_match_quality_limit
-                for reference in paper.references
+                fuzz.partial_ratio(author, contains) >= quality_limit
+                for author in paper.authors
             )
         ):
             out.append(paper)
             out_len += 1
-
-            # break if query length limit reached
             if out_len >= length:
                 break
 
@@ -525,7 +496,7 @@ async def get_paper(
     paper = await collection.document(id).get(["document_name", "document_mimetype"])
     if not paper.exists:
         raise HTTPException(
-            400,
+            404,
             f"Paper with `id`: {id} does not exist in `{paper_type}` collection",
         )
 
@@ -535,3 +506,44 @@ async def get_paper(
         media_type=paper_dict["document_mimetype"],
         filename=paper_dict["document_name"],
     )
+
+
+@app.get("/num-papers")
+async def count_papers() -> int:
+    total = 0
+
+    async for _ in published.select([]).stream():
+        total += 1
+
+    return total
+
+
+@app.put("/feature")
+async def feature(id: str, key: str = Depends(key_header)) -> None:
+    if key != KEY:
+        raise HTTPException(401)
+
+    if not (await published.document(id).get([])).exists:
+        raise HTTPException(
+            404, f"Document with id `{id}` does not exist in `published` collection"
+        )
+
+    await featured.document(id).set({})
+
+
+@app.put("/unfeature")
+async def unfeature(id: str, key: str = Depends(key_header)) -> None:
+    if key != KEY:
+        raise HTTPException(401)
+
+    await featured.document(id).delete()
+
+
+@app.get("/features")
+async def list_featured() -> list[Paper]:
+    # iterates through all the paper id in featured collection, requests for the paper data, and returns it
+
+    return [
+        Paper.model_validate((await published.document(paper_code.id).get()).to_dict())
+        async for paper_code in featured.stream()
+    ]
