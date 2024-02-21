@@ -481,7 +481,7 @@ async def list_papers(
 
 @app.get("/get/{paper_type}")
 async def get_paper(
-    paper_type: Literal["published", "reviewing"],
+    paper_type: Literal["published", "reviewing", "journal"],
     id: str,
     key: str = Depends(key_header),
 ) -> FileResponse:
@@ -492,6 +492,13 @@ async def get_paper(
             if key != KEY:
                 raise HTTPException(401)
             collection = reviewing
+        case "journal":
+            path = f"{DOCS_PATH}/journals/{id}"
+            if not (await aiofiles.os.path.isfile(path)):
+                raise HTTPException(
+                    404, "A publication with that id could not be found"
+                )
+            return FileResponse(path, media_type="application/pdf", filename=id)
 
     paper = await collection.document(id).get(["document_name", "document_mimetype"])
     if not paper.exists:
@@ -547,3 +554,15 @@ async def list_featured() -> list[Paper]:
         Paper.model_validate((await published.document(paper_code.id).get()).to_dict())
         async for paper_code in featured.stream()
     ]
+
+
+@app.post("/journal")
+async def publish_journal(title: str, doc: UploadFile) -> None:
+    if doc.content_type != "application/pdf":
+        raise HTTPException(415, "Please upload `.pdf` files only")
+    if await aiofiles.os.path.exists(f"{DOCS_PATH}/journals/{title}"):
+        raise HTTPException(422, "A publication with that title already exists")
+
+    async with aiofiles.open(f"{DOCS_PATH}/journals/{title}", "wb") as file:
+        await file.write(await doc.read(-1))
+    await doc.close()
