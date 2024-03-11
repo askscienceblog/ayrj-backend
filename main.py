@@ -23,7 +23,7 @@ KEY = "In science we find truth, @ ayrj we have this API"  # protect at all cost
 MATCH_DOI = re.compile("10\\.[\\.0-9]+/\\S*\\w")
 
 # file path for mounted gcloud storage FUSE
-DOCS_PATH = "/home/profile/ayrj-docs"
+DOCS_PATH = "/ayrj-docs"
 
 db = firestore.AsyncClient(project="ayrj-backend")
 
@@ -72,7 +72,7 @@ async def generate_unique_document_id() -> str:
     code = format_id_to_string(id)
 
     # check if the id is already used, increment it until it is no longer in use
-    while await aiofiles.os.path.exists(f"{DOCS_PATH}/{code}"):
+    while await aiofiles.os.path.exists(f"{DOCS_PATH}/papers/{code}"):
         id = randint(0, 999_999_999)
         code = format_id_to_string(id)
 
@@ -180,7 +180,7 @@ async def submit(
     code = await generate_unique_document_id()
 
     # save the document and close the temp file
-    async with aiofiles.open(f"{DOCS_PATH}/{code}", "wb") as file:
+    async with aiofiles.open(f"{DOCS_PATH}/papers/{code}", "wb") as file:
         await file.write(await doc.read(-1))
     await doc.close()
 
@@ -242,7 +242,7 @@ async def reject(id: str, key: str = Depends(key_header)) -> None:
         raise HTTPException(401)
 
     await reviewing.document(id).delete()
-    await aiofiles.os.remove(f"{DOCS_PATH}/{id}")
+    await aiofiles.os.remove(f"{DOCS_PATH}/papers/{id}")
 
 
 @app.patch("/review")
@@ -284,7 +284,7 @@ async def review(
             case _:
                 raise HTTPException(415, "Upload `.pdf`, `.doc` or `.docx` files only")
 
-        async with aiofiles.open(f"{DOCS_PATH}/{id}", "wb") as file:
+        async with aiofiles.open(f"{DOCS_PATH}/papers/{id}", "wb") as file:
             await file.write(await doc.read(-1))
         await doc.close()
 
@@ -352,11 +352,11 @@ async def remove(id: str, key: str = Depends(key_header)) -> None:
     for correction in paper.to_dict()["corrected"]:
         correction_id = correction["id"]
         # remove all document data but leave the document name, this will prevent retracted `id`s from being reused
-        async with aiofiles.open(f"{DOCS_PATH}/{correction_id}", "wb") as _:
+        async with aiofiles.open(f"{DOCS_PATH}/papers/{correction_id}", "wb") as _:
             pass
 
     # remove all document data but leave the document name, this will prevent retracted `id`s from being reused
-    async with aiofiles.open(f"{DOCS_PATH}/{id}", "wb") as _:
+    async with aiofiles.open(f"{DOCS_PATH}/papers/{id}", "wb") as _:
         pass
 
 
@@ -385,7 +385,7 @@ async def correct(
     code = await generate_unique_document_id()
     paper_dict = paper.to_dict()
 
-    async with aiofiles.open(f"{DOCS_PATH}/{code}", "wb") as file:
+    async with aiofiles.open(f"{DOCS_PATH}/papers/{code}", "wb") as file:
         await file.write(await doc.read(-1))
     await doc.close()
 
@@ -481,7 +481,7 @@ async def list_papers(
 
 @app.get("/get/{paper_type}")
 async def get_paper(
-    paper_type: Literal["published", "reviewing", "journal"],
+    paper_type: Literal["published", "reviewing", "journal", "template", "form"],
     id: str,
     key: str = Depends(key_header),
 ) -> FileResponse:
@@ -499,6 +499,18 @@ async def get_paper(
                     404, "A publication with that id could not be found"
                 )
             return FileResponse(path, media_type="application/pdf", filename=id)
+        case "template":
+            return FileResponse(
+                f"{DOCS_PATH}/template",
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                filename="AYRJ Manuscript Template",
+            )
+        case "form":
+            return FileResponse(
+                f"{DOCS_PATH}/form",
+                media_type="application/pdf",
+                filename="AYRJ Application Form",
+            )
 
     paper = await collection.document(id).get(["document_name", "document_mimetype"])
     if not paper.exists:
@@ -509,7 +521,7 @@ async def get_paper(
 
     paper_dict = paper.to_dict()
     return FileResponse(
-        f"{DOCS_PATH}/{id}",
+        f"{DOCS_PATH}/papers/{id}",
         media_type=paper_dict["document_mimetype"],
         filename=paper_dict["document_name"],
     )
@@ -557,7 +569,11 @@ async def list_featured() -> list[Paper]:
 
 
 @app.post("/journal")
-async def publish_journal(title: str, doc: UploadFile) -> None:
+async def publish_journal(
+    title: str, doc: UploadFile, key: str = Depends(key_header)
+) -> None:
+    if key != KEY:
+        raise HTTPException(401)
     if doc.content_type != "application/pdf":
         raise HTTPException(415, "Please upload `.pdf` files only")
     if await aiofiles.os.path.exists(f"{DOCS_PATH}/journals/{title}"):
