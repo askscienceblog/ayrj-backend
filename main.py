@@ -591,7 +591,12 @@ async def newsletter_sign_up(info: NewsletterRecipientInfo) -> None:
 
 
 @app.get("/recipients")
-async def news_letter_recipients() -> list[NewsletterRecipientInfo]:
+async def news_letter_recipients(
+    key: str = Depends(key_header),
+) -> list[NewsletterRecipientInfo]:
+    if key != KEY:
+        raise HTTPException(401)
+
     return [
         NewsletterRecipientInfo.model_validate(recipient.to_dict())
         async for recipient in newsletter.stream()
