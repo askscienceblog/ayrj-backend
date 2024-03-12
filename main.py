@@ -41,6 +41,8 @@ retracted: firestore.AsyncCollectionReference
 
 featured = db.collection("featured")
 
+newsletter = db.collection("news")
+
 
 def format_id_to_string(id: int) -> str:
     """Returns string of `id` padded with `0`s on the left until 9 digits long and then split every 3 digits with a `-`"""
@@ -218,16 +220,14 @@ async def publish(id: str, key: str = Depends(key_header)) -> None:
             404, f"Document with id {id} does not exist in `reviewing` collection"
         )
 
-    paper_dict = paper.to_dict()
-
-    if paper_dict["document_mimetype"] != "application/pdf":
+    if paper.get("document_mimetype") != "application/pdf":
         raise HTTPException(415, "Change paper document to pdf before publication")
 
     now = datetime.now(tz=timezone.utc)
     await reviewing.document(id).update(
         {
             "published": now,
-            "document_name": f"{generate_author_shorthand(paper_dict['authors'])} ({now.strftime('%Y')}).pdf",
+            "document_name": f"{generate_author_shorthand(paper.get('authors'))} ({now.strftime('%Y')}).pdf",
         }
     )
 
@@ -271,8 +271,6 @@ async def review(
 
     update_dict = {}
 
-    paper_dict = paper.to_dict()
-
     if doc is not None:
         match doc.content_type:
             case "application/msword":
@@ -289,7 +287,7 @@ async def review(
         await doc.close()
 
         update_dict |= {
-            "document_name": f"{generate_author_shorthand(paper_dict['authors'])} DRAFT.{extension}",
+            "document_name": f"{generate_author_shorthand(paper.get('authors'))} DRAFT.{extension}",
             "document_mimetype": doc.content_type,
         }
 
@@ -349,7 +347,7 @@ async def remove(id: str, key: str = Depends(key_header)) -> None:
 
     await paper_ref.delete()
 
-    for correction in paper.to_dict()["corrected"]:
+    for correction in paper.get("corrected"):
         correction_id = correction["id"]
         # remove all document data but leave the document name, this will prevent retracted `id`s from being reused
         async with aiofiles.open(f"{DOCS_PATH}/papers/{correction_id}", "wb") as _:
@@ -383,7 +381,6 @@ async def correct(
         )
 
     code = await generate_unique_document_id()
-    paper_dict = paper.to_dict()
 
     async with aiofiles.open(f"{DOCS_PATH}/papers/{code}", "wb") as file:
         await file.write(await doc.read(-1))
@@ -397,7 +394,7 @@ async def correct(
                         id=code,
                         date=datetime.now(tz=timezone.utc),
                         description=description,
-                        document_name=f"{generate_author_shorthand(paper_dict['authors'])} ({paper_dict['published'].strftime('%Y')}) Correction {len(paper_dict['corrected'])+1}.pdf",
+                        document_name=f"{generate_author_shorthand(paper.get('authors'))} ({paper.get('published').strftime('%Y')}) Correction {len(paper.get('corrected'))+1}.pdf",
                     ).model_dump()
                 ]
             ),
@@ -519,11 +516,10 @@ async def get_paper(
             f"Paper with `id`: {id} does not exist in `{paper_type}` collection",
         )
 
-    paper_dict = paper.to_dict()
     return FileResponse(
         f"{DOCS_PATH}/papers/{id}",
-        media_type=paper_dict["document_mimetype"],
-        filename=paper_dict["document_name"],
+        media_type=paper.get("document_mimetype"),
+        filename=paper.get("document_name"),
     )
 
 
@@ -582,3 +578,21 @@ async def publish_journal(
     async with aiofiles.open(f"{DOCS_PATH}/journals/{title}", "wb") as file:
         await file.write(await doc.read(-1))
     await doc.close()
+
+
+class NewsletterRecipientInfo(BaseModel):
+    name: str
+    email: str
+
+
+@app.post("/sign-up")
+async def newsletter_sign_up(info: NewsletterRecipientInfo) -> None:
+    await newsletter.document(info.email).set(info.model_dump())
+
+
+@app.get("/recipients")
+async def news_letter_recipients() -> list[NewsletterRecipientInfo]:
+    return [
+        NewsletterRecipientInfo.model_validate(recipient.to_dict())
+        async for recipient in newsletter.stream()
+    ]
