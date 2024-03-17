@@ -131,6 +131,8 @@ class Paper(BaseModel):
     document_name: str
     document_mimetype: str
 
+    icon_names: list[str] = []
+
 
 app = FastAPI()
 
@@ -152,6 +154,7 @@ async def submit(
     category: str = Form(),
     references: list[str] = Form(),
     doc: UploadFile = File(),
+    icons: list[UploadFile] = File([]),
     key: str = Depends(key_header),
 ) -> str:
     """Handles initialising all paper data and adding it to the `reviewing` collection"""
@@ -173,6 +176,10 @@ async def submit(
                 f"Upload `.pdf`, `.doc` or `.docx` files only, not `{doc.content_type}`",
             )
 
+    # validate that all uploaded images are pngs
+    if not all(ico.content_type == "image/png" for ico in icons):
+        raise HTTPException(415, "Upload `.png` images only")
+
     # shorthand for authors, also validates that `authors` is non-empty
     try:
         shorthand = generate_author_shorthand(authors)
@@ -185,6 +192,11 @@ async def submit(
     async with aiofiles.open(f"{DOCS_PATH}/papers/{code}", "wb") as file:
         await file.write(await doc.read(-1))
     await doc.close()
+
+    for i, icon in enumerate(icons):
+        async with aiofiles.open(f"{DOCS_PATH}/images/{code}-{i+1}", "wb") as file:
+            await file.write(await icon.read(-1))
+        await icon.close()
 
     # create the `Paper` object, using pydantic parser to enforce type checking
     # then upload it to firestore
@@ -199,6 +211,7 @@ async def submit(
             submitted=datetime.now(tz=timezone.utc),
             document_name=f"{shorthand} DRAFT{extension}",
             document_mimetype=doc.content_type,
+            icon_names=[ico.filename for ico in icons],
         ).model_dump()
     )
 
@@ -241,7 +254,18 @@ async def reject(id: str, key: str = Depends(key_header)) -> None:
     if key != KEY:
         raise HTTPException(401)
 
-    await reviewing.document(id).delete()
+    paper_ref = reviewing.document(id)
+    paper = await paper_ref.get(["icon_names"])
+
+    if not paper.exists:
+        raise HTTPException(
+            404, f"Could not find paper with id `{id}` in `reviewing` collection"
+        )
+
+    for i in range(len(paper.get("icon_names"))):
+        await aiofiles.os.remove(f"{DOCS_PATH}/images/{id}-{i+1}")
+
+    await paper_ref.delete()
     await aiofiles.os.remove(f"{DOCS_PATH}/papers/{id}")
 
 
@@ -352,6 +376,10 @@ async def remove(id: str, key: str = Depends(key_header)) -> None:
         # remove all document data but leave the document name, this will prevent retracted `id`s from being reused
         async with aiofiles.open(f"{DOCS_PATH}/papers/{correction_id}", "wb") as _:
             pass
+
+    for i in range(len(paper.get("icon_names"))):
+        # safe to delete since id will never get re-used
+        await aiofiles.os.remove(f"{DOCS_PATH}/images/{id}-{i+1}")
 
     # remove all document data but leave the document name, this will prevent retracted `id`s from being reused
     async with aiofiles.open(f"{DOCS_PATH}/papers/{id}", "wb") as _:
@@ -601,3 +629,31 @@ async def news_letter_recipients(
         NewsletterRecipientInfo.model_validate(recipient.to_dict())
         async for recipient in newsletter.stream()
     ]
+
+
+@app.get("/icons/{paper_type}")
+async def get_paper_icons(
+    paper_type: Literal["published", "reviewing"],
+    id: str,
+    index: NonNegativeInt,
+    key: str = Depends(key_header),
+) -> FileResponse:
+    match paper_type:
+        case "published":
+            collection = published
+        case "reviewing":
+            if key != KEY:
+                raise HTTPException(401)
+            collection = reviewing
+
+    paper = await collection.document(id).get(["icon_names"])
+    if not paper.exists:
+        raise HTTPException(
+            404, f"Paper with `id`: {id} does not exist in `{paper_type}` collection"
+        )
+
+    return FileResponse(
+        f"{DOCS_PATH}/images/{id}-{index+1}",
+        filename=paper.get("icon_names")[index],
+        media_type="image/png",
+    )
