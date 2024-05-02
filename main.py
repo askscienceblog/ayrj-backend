@@ -16,7 +16,7 @@ from thefuzz import fuzz
 
 # used to authenticate access to restricted parts of this api
 key_header = APIKeyHeader(name="x-ayrj-key", auto_error=False)
-KEY = "In science we find truth, @ ayrj we have this API"  # protect at all cost. if this leaks, we have lost everything
+KEY = ""  # protect at all cost. if this leaks, we have lost everything
 
 # regex to match doi urls so that they can be automatically extracted
 # this is not foul-proof, there is no way to check if the matched url is valid without actually requesting doi.org
